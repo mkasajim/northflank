@@ -4,8 +4,30 @@ const { WebSocket, createWebSocketStream } = require('ws');
 const { TextDecoder } = require('util');
 
 // Helper functions for logging
-const logcb = (...args) => console.log.bind(this, ...args);
-const errcb = (...args) => console.error.bind(this, ...args);
+const debugEnabled = /^(1|true|yes)$/i.test(process.env.DEBUG || "");
+const debugLog = (...args) => {
+    if (debugEnabled) {
+        console.log(...args);
+    }
+};
+const isExpectedDisconnect = err => {
+    if (!err) {
+        return false;
+    }
+
+    return err.code === 'ECONNRESET'
+        || err.code === 'EPIPE'
+        || err.code === 'ERR_STREAM_PREMATURE_CLOSE'
+        || /WebSocket is not open|Socket is closed|Premature close/i.test(err.message || "");
+};
+const logError = (label, err, context = {}) => {
+    if (isExpectedDisconnect(err)) {
+        debugLog(label, err.message, context);
+        return;
+    }
+
+    console.error(label, context, err);
+};
 
 // Configuration for the VLESS proxy
 // The UUID can be set via environment variable or defaults to a specific value
@@ -229,65 +251,143 @@ server.on('upgrade', (request, socket, head) => {
 
 // WebSocket server connection handling logic (original VLESS proxy logic)
 wss.on('connection', ws => {
-    console.log("on connection");
+    debugLog("WebSocket connection opened");
+    let targetSocket;
+
+    const closeTarget = () => {
+        if (targetSocket && !targetSocket.destroyed) {
+            targetSocket.destroy();
+        }
+    };
+
+    ws.once('close', closeTarget);
+    ws.once('error', err => {
+        logError('WebSocket error:', err);
+        closeTarget();
+    });
+
     ws.once('message', msg => {
+        if (!Buffer.isBuffer(msg) || msg.length < 24) {
+            debugLog("Malformed VLESS handshake. Connection rejected.");
+            ws.close();
+            return;
+        }
+
         const [VERSION] = msg; // Get the VLESS version
         const id = msg.slice(1, 17); // Extract the UUID from the message
 
         // Validate the UUID received from the client against the server's UUID
         if (!id.every((v, i) => v === parseInt(uuid.substr(i * 2, 2), 16))) {
-            console.log("UUID mismatch. Connection rejected.");
+            debugLog("UUID mismatch. Connection rejected.");
             ws.close(); // Close the connection if UUID doesn't match
             return;
         }
 
         // Determine the offset for the address type (ATYP)
         let i = msg.slice(17, 18).readUInt8() + 19;
+        if (msg.length < i + 3) {
+            debugLog("Incomplete VLESS request header. Connection rejected.");
+            ws.close();
+            return;
+        }
+
         const port = msg.slice(i, i += 2).readUInt16BE(0); // Extract the target port
         const ATYP = msg.slice(i, i += 1).readUInt8(); // Extract the address type
 
         let host;
         // Parse the target host based on ATYP
         if (ATYP === 1) { // IPv4
+            if (msg.length < i + 4) {
+                debugLog("Incomplete IPv4 address. Connection rejected.");
+                ws.close();
+                return;
+            }
             host = msg.slice(i, i += 4).join('.');
         } else if (ATYP === 2) { // Domain name
-            host = new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8()));
+            if (msg.length < i + 1) {
+                debugLog("Incomplete domain length. Connection rejected.");
+                ws.close();
+                return;
+            }
+            const domainLength = msg.slice(i, i + 1).readUInt8();
+            if (msg.length < i + 1 + domainLength) {
+                debugLog("Incomplete domain address. Connection rejected.");
+                ws.close();
+                return;
+            }
+            host = new TextDecoder().decode(msg.slice(i + 1, i += 1 + domainLength));
         } else if (ATYP === 3) { // IPv6
+            if (msg.length < i + 16) {
+                debugLog("Incomplete IPv6 address. Connection rejected.");
+                ws.close();
+                return;
+            }
             host = msg.slice(i, i += 16).reduce((s, b, idx, arr) => (idx % 2 ? s.concat(arr.slice(idx - 1, idx + 1)) : s), [])
                 .map(b => b.readUInt16BE(0).toString(16))
                 .join(':');
         } else {
-            console.log("Unsupported ATYP:", ATYP);
+            debugLog("Unsupported ATYP:", ATYP);
             ws.close();
             return;
         }
 
-        logcb('conn:', host, port); // Log the connection details
+        debugLog('conn:', host, port); // Log the connection details
 
         // Send a success response to the client (VLESS handshake response)
-        ws.send(new Uint8Array([VERSION, 0]));
+        if (ws.readyState !== WebSocket.OPEN) {
+            closeTarget();
+            return;
+        }
+        ws.send(new Uint8Array([VERSION, 0]), err => {
+            if (err) {
+                logError('VLESS response send error:', err, { host, port });
+                closeTarget();
+            }
+        });
 
         // Create a duplex stream from the WebSocket for piping data
         const duplex = createWebSocketStream(ws);
+        duplex.on('error', err => {
+            logError('WebSocket stream error:', err, { host, port });
+            closeTarget();
+        });
 
         // Connect to the target host and port
-        net.connect({ host, port }, function () {
+        targetSocket = net.connect({ host, port }, function () {
+            if (ws.readyState !== WebSocket.OPEN) {
+                closeTarget();
+                return;
+            }
+
             // Write the remaining part of the client's initial message to the target
             this.write(msg.slice(i));
             // Pipe data between the WebSocket and the target connection
-            duplex.on('error', errcb('E1:')).pipe(this).on('error', errcb('E2:')).pipe(duplex);
-        }).on('error', errcb('Conn-Err:', { host, port })); // Handle connection errors to the target
-    }).on('error', errcb('EE:')); // Handle errors on the WebSocket message
+            duplex.pipe(this).pipe(duplex);
+        });
+
+        targetSocket.on('error', err => {
+            logError('Target connection error:', err, { host, port });
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+        });
+
+        targetSocket.once('close', () => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+        });
+    });
 });
 
 // Start the HTTP server listening on the specified port
 server.listen(port, () => {
-    logcb('Server listening on port:', port);
-    logcb('VLESS Proxy UUID:', uuid); // Still logged to console for server admin
-    logcb('Access home page at: http://localhost:' + port);
+    console.log('Server listening on port:', port);
+    debugLog('VLESS Proxy UUID:', uuid); // Still logged to console for server admin
+    debugLog('Access home page at: http://localhost:' + port);
 });
 
 // Handle server errors
 server.on('error', err => {
-    errcb('Server Error:', err);
+    logError('Server Error:', err);
 });
